@@ -1,0 +1,9 @@
+nvcc -std=c++17 -O3 -DNDEBUG --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -Xcompiler=-fPIE -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing --generate-code arch=compute_90a,code=[compute_90a,sm_90a] -lcublas -lcuda -lineinfo -I/usr/local/cuda-12.6/include  matmul.cu -o out/matmul
+Build successful.
+KERNEL 7
+Average elapsed time: (0.004733) s, performance: (  784.0) TFLOPS. size: (12288).
+
+KERNEL 0
+Average elapsed time: (0.004510) s, performance: (  822.8) TFLOPS. size: (12288).
+
+Program executed successfully.
