@@ -1,4 +1,4 @@
-NVCC_FLAGS = -std=c++17 -O3 -DNDEBUG
+NVCC_FLAGS = -std=c++17 -O3 -DNDEBUG -w
 NVCC_LDFLAGS = -lcublas -lcuda
 NVCC_INCLUDES = -I/usr/local/cuda-12.6/include
 NVCC_LDLIBS =
@@ -15,10 +15,10 @@ NCU_PATH := $(shell which ncu)
 NCU_COMMAND = sudo $(NCU_PATH) --set full --import-source yes
 
 NVCC_FLAGS += --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -Xcompiler=-fPIE -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing
-NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+# NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
 # NVCC_FLAGS += --ptxas-options=-v,--register-usage-level=10
 # NVCC_FLAGS += -gencode arch=compute_90a,code=sm_90a -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills
-# NVCC_FLAGS += -arch=sm_90a
+NVCC_FLAGS += -arch=sm_90a
 
 NVCC_BASE = nvcc $(NVCC_FLAGS) $(NVCC_LDFLAGS) -lineinfo $(NVCC_INCLUDES) $(NVCC_LDLIBS)
 

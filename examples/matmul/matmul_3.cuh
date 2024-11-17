@@ -343,6 +343,8 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
         uint32_t lane = tid & 31;
         uint32_t warp = tid / 32;
         uint32_t row = warp*16 + lane / 4;
+
+        // __nv_bfloat162* block_C = reinterpret_cast<__nv_bfloat162*>(C + num_block_m*BLOCK_M*N + num_block_n*BLOCK_N);
         bf16 *block_C = C + num_block_n*BLOCK_N*M + num_block_m*BLOCK_M;
 
         #pragma unroll
@@ -350,18 +352,27 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
             int yo = m_it*WGMMA_M + wg_idx*BLOCK_WG_M;
             #pragma unroll
             for (uint32_t w = 0; w < WGMMA_N/16; ++w) {
+                // int col = 8*w + (tid % 4);
+                // #define IDX(i, j) ((((i) + yo)*N/2 + (j)))
+                // block_C[IDX(row, col + 4)] = __halves2bfloat162(d[m_it][w][4], d[m_it][w][5]);
+                // block_C[IDX(row, col)] = __halves2bfloat162(d[m_it][w][0], d[m_it][w][1]);
+                
+                // block_C[IDX(row + 8, col + 4)] = __halves2bfloat162(d[m_it][w][6], d[m_it][w][7]);
+                // block_C[IDX(row + 8, col)] = __halves2bfloat162(d[m_it][w][2], d[m_it][w][3]);
+                
+                // #undef IDX
                 int col = 16*w + 2*(tid % 4);
                 #define IDX(i, j) ((j)*M + ((i) + yo))
 
                 __stwt(&block_C[IDX(row, col)], d[m_it][w][0]);
-                __stwt(&block_C[IDX(row, col+1)], d[m_it][w][1]);
                 __stwt(&block_C[IDX(row+8, col)], d[m_it][w][2]);
+                __stwt(&block_C[IDX(row, col+1)], d[m_it][w][1]);
                 __stwt(&block_C[IDX(row+8, col+1)], d[m_it][w][3]);
-
                 __stwt(&block_C[IDX(row, col+8)], d[m_it][w][4]);
-                __stwt(&block_C[IDX(row, col+9)], d[m_it][w][5]);
                 __stwt(&block_C[IDX(row+8, col+8)], d[m_it][w][6]);
+                __stwt(&block_C[IDX(row, col+9)], d[m_it][w][5]);
                 __stwt(&block_C[IDX(row+8, col+9)], d[m_it][w][7]);
+                
                 #undef IDX
             }
         }
@@ -380,10 +391,10 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
 
 
 void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
-    constexpr int BLOCK_M = 64*3;
-    constexpr int BLOCK_N = 192;
+    constexpr int BLOCK_M = 64*2;
+    constexpr int BLOCK_N = 256;
     constexpr int BLOCK_K = 64;
-    constexpr int NUM_THREADS = 128*3;
+    constexpr int NUM_THREADS = 128*2;
 
     if (!d_tma_map_A) {
         d_tma_map_A = allocate_and_create_tensor_map<BLOCK_M, BLOCK_K>(A, M / BLOCK_M, K / BLOCK_K);

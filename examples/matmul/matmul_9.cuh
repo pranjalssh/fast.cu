@@ -1,5 +1,5 @@
 
-namespace M6 {
+namespace M9 {
 
 // using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
@@ -43,7 +43,7 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
-        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address, gmem_prob_shape,
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address, gmem_prob_shape,
         gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
@@ -236,12 +236,6 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB
         wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
-template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES>
-struct SMem {
-    alignas(128) bf16 A[BLOCK_M*BLOCK_K*STAGES];
-    alignas(128) bf16 B[BLOCK_K*BLOCK_N*STAGES];
-};
-
 template <uint32_t RegCount>
 __device__ void warpgroup_reg_alloc() {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
@@ -272,8 +266,8 @@ __device__ static inline void load_async(bf16 *dst, void const* const src_tma_ma
     uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
     asm volatile (
-        "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];"
         :
         : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
         "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
@@ -305,6 +299,49 @@ __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
         : "r"(mbar_ptr), "r"(count)
         : "memory"
     );
+}
+
+__device__ static __forceinline__ void wait_cluster(uint64_t* bar, int kPhaseBit) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
+    asm volatile (
+        "{\n"
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
+        "@P1                       bra.uni DONE;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n"
+        :: "r"(mbar_ptr),
+        "r"(kPhaseBit)
+    );
+}
+
+__device__ static inline void load_async_multicast(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx, uint16_t cluster_mask) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
+        " [%0], [%1, {%3, %4, %5}], [%2], %6;"
+        :
+        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+        "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(cluster_mask)
+        : "memory"
+    );
+}
+
+__device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(count));
 }
 
 template<int VERSION, int NUM_SM, int BLOCK_M, int BLOCK_N, int TM, int TN>
@@ -383,7 +420,7 @@ struct Schedule<2, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
     }
 
     __device__ __forceinline__ bool next(int &block_m, int& block_n) {
-        if (it == SPACE_LEN) {
+        if (it >= SPACE_LEN) {
             return false;
         }
         int now = space[it];
@@ -397,34 +434,72 @@ struct Schedule<2, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
     }
 };
 
-template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int NUM_THREADS, int STAGES, int NUM_SM>
-__global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int *dspace) {
+__device__ uint32_t elect_one_sync() {
+    uint32_t pred = 0;
+    uint32_t laneid = 0;
+    asm volatile(
+        "{\n"
+        ".reg .b32 %rx;\n"
+        ".reg .pred %px;\n"
+        "     elect.sync %rx|%px, %2;\n"
+        "@%px mov.s32 %1, 1;\n"
+        "     mov.s32 %0, %rx;\n"
+        "}\n"
+        : "+r"(laneid), "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES, int NUM_WG>
+struct SMem {
+    alignas(128) bf16 A[NUM_WG][BLOCK_M/NUM_WG*BLOCK_K*STAGES];
+    alignas(128) bf16 B[NUM_WG][BLOCK_K*BLOCK_N*STAGES];
+    alignas(8) uint64_t full[NUM_WG][STAGES], empty[NUM_WG][STAGES];
+    int space[SPACE_LEN];
+};
+
+template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int NUM_THREADS, int STAGES, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel9(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BLOCK_N;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int BLOCK_WG_M = BLOCK_M / num_consumers;
+    constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
+    assert((M / BLOCK_M) % CLUSTER_M == 0);
+    assert((N / BLOCK_N) % CLUSTER_N == 0);
 
     extern __shared__ __align__(128) uint8_t smem[];
-    SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES> &s = *reinterpret_cast<SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES>*>(smem);
-    bf16 *sA = s.A;
-    bf16 *sB = s.B;
-    // Declare barriers
-    __shared__ __align__(8) uint64_t full[STAGES], empty[STAGES];
-    __shared__ int space[SPACE_LEN];
-    if (threadIdx.x < SPACE_LEN) space[threadIdx.x] = dspace[blockIdx.x*SPACE_LEN+threadIdx.x];
+    SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_consumers> &s = *reinterpret_cast<SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_consumers>*>(smem);
+    bf16 *sA[num_consumers];
+    bf16 *sB[num_consumers];
+    uint64_t* full[num_consumers];
+    uint64_t* empty[num_consumers];
+    for (int c = 0; c < num_consumers; ++c) sA[c] = s.A[c], sB[c] = s.B[c], full[c] = s.full[c], empty[c] = s.empty[c];
+    int* space = s.space;
+    
+    uint32_t rank;
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
+    if (threadIdx.x < SPACE_LEN) space[threadIdx.x] = dspace[rank*SPACE_LEN+threadIdx.x];
 
     const int num_blocks_k = K / BLOCK_K;
     int wg_idx = threadIdx.x / 128;
     int tid = threadIdx.x % 128;
 
     if (threadIdx.x == 0) {
-        for (int i = 0; i < STAGES; ++i) {
-            init_barrier(&full[i], 0, 1);
-            init_barrier(&empty[i], 0, num_consumers);
+        for (int stage = 0; stage < STAGES; ++stage) {
+            for (int c = 0; c < num_consumers; ++c) {
+                init_barrier(&full[c][stage], 0, 1);
+                init_barrier(&empty[c][stage], 0, CLUSTERS);
+            }
         }
     }
-    __syncthreads();
+    asm volatile("barrier.cluster.arrive;\n" : :);
+    asm volatile("barrier.cluster.wait;\n" : :);
 
-    Schedule<2, NUM_SM, BLOCK_M, BLOCK_N, 16, 8> schedule(M, N, blockIdx.x, space);
+    Schedule<2, NUM_SM/CLUSTERS, BLOCK_M*CLUSTER_M, BLOCK_N*CLUSTER_N, 16/CLUSTER_M, 8/CLUSTER_N> schedule(M, N, rank, &space[0]);
+    
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
+    uint32_t rank_m = rank / CLUSTER_N;
+    uint32_t rank_n = rank % CLUSTER_N;
 
     // Producer
     if (wg_idx == 0) {
@@ -433,15 +508,39 @@ __global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int
         if (tid == 0) {
             int p = 0;
             int stage = 0;
+            uint32_t col_mask = 0;
+            for (int i = 0; i < CLUSTER_M; ++i) {
+                col_mask |= (1 << (i * CLUSTER_N));
+            }
             int num_block_m, num_block_n;
             while (schedule.next(num_block_m, num_block_n)) {
+                num_block_n = num_block_n * CLUSTER_N + rank_n;
+                num_block_m = num_block_m * CLUSTER_M + rank_m;
+                
                 for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++stage) {
                     if (stage == STAGES) { stage = 0; p ^= 1; }
-                    wait(&empty[stage], p);
-                    expect_bytes(&full[stage], (BLOCK_K*BLOCK_N+BLOCK_K*BLOCK_M)*sizeof(bf16));
-                    load_async(&sA[stage*BLOCK_K*BLOCK_M], &tensorMapA, &full[stage], block_k_iter*BLOCK_K, num_block_m*BLOCK_M);
-                    load_async(&sB[stage*BLOCK_K*BLOCK_N], &tensorMapB, &full[stage], block_k_iter*BLOCK_K, num_block_n*BLOCK_N);
-                }   
+                    #pragma unroll
+                    for (int widx = 0; widx < num_consumers; ++widx) {
+                        wait(&empty[widx][stage], p);
+                        expect_bytes(&full[widx][stage], (BLOCK_K*BLOCK_WG_M + BLOCK_K*BLOCK_N)*sizeof(bf16));
+                        if constexpr (CLUSTER_M > 1) {
+                            if (rank_m == 0) {
+                                load_async_multicast(&sB[widx][stage*BLOCK_K*BLOCK_N], &tensorMapB, &full[widx][stage], block_k_iter*BLOCK_K, num_block_n*BLOCK_N, col_mask << rank_n);
+                            }
+                        } else {
+                            load_async(&sB[widx][stage*BLOCK_K*BLOCK_N], &tensorMapB, &full[widx][stage], block_k_iter*BLOCK_K, num_block_n*BLOCK_N);
+                        }
+
+                        if constexpr (CLUSTER_N > 1) {
+                            uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                            if (rank_n == 0) {
+                                load_async_multicast(&sA[widx][stage*BLOCK_K*BLOCK_WG_M], &tensorMapA, &full[widx][stage], block_k_iter*BLOCK_K, num_block_m*BLOCK_M + widx*BLOCK_WG_M, mask);
+                            }
+                        } else {
+                            load_async(&sA[widx][stage*BLOCK_K*BLOCK_WG_M], &tensorMapA, &full[widx][stage], block_k_iter*BLOCK_K, num_block_m*BLOCK_M + widx*BLOCK_WG_M);
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -449,28 +548,31 @@ __global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int
         warpgroup_reg_alloc<num_regs>();
         float d[BLOCK_WG_M/WGMMA_M][WGMMA_N/16][8];
         --wg_idx;
-        for (int i = 0; i < STAGES; ++i) {
-            if (tid == 0) arrive(&empty[i], 1);
+        for (int stage = 0; stage < STAGES; ++stage) {
+            if (tid < CLUSTERS) arrive_cluster(&empty[wg_idx][stage], tid);
         }
         int p = 0;
         int stage = 0;
+        int lane = tid % 32, warp = tid / 32, row = warp*16 + lane / 4;
         int num_block_m, num_block_n;
         while (schedule.next(num_block_m, num_block_n)) {
+            num_block_n = num_block_n * CLUSTER_N + rank_n;
+            num_block_m = num_block_m * CLUSTER_M + rank_m;
             {
                 if (stage == STAGES) {stage = 0; p ^= 1; };
-                wait(&full[stage], p);
+                wait(&full[wg_idx][stage], p);
                 warpgroup_arrive();
                 #pragma unroll
                 for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + stage*BLOCK_K*BLOCK_M + 64*(m_it + wg_idx*BLOCK_WG_M/WGMMA_M)*WGMMA_M;
-                    bf16 *wgmma_sB = sB + stage*BLOCK_K*BLOCK_N;
+                    bf16 *wgmma_sA = sA[wg_idx] + stage*BLOCK_K*BLOCK_WG_M + 64*m_it*WGMMA_M;
+                    bf16 *wgmma_sB = sB[wg_idx] + stage*BLOCK_K*BLOCK_N;
                     {
                         wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
                         #pragma unroll
                         for (int k_it = 1; k_it < 64/WGMMA_K; ++k_it) {
                             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
                         }
-                        wgmma_sA += 64*BLOCK_M;
+                        wgmma_sA += 64*BLOCK_WG_M;
                         wgmma_sB += 64*BLOCK_N;
                     }
                     #pragma unroll
@@ -479,57 +581,54 @@ __global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int
                         for (int k_it = 0; k_it < 64/WGMMA_K; ++k_it) {
                             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
                         }
-                        wgmma_sA += 64*BLOCK_M;
+                        wgmma_sA += 64*BLOCK_WG_M;
                         wgmma_sB += 64*BLOCK_N;
                     }
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                if (tid == 0) arrive(&empty[stage], 1);
+                if (tid < CLUSTERS) arrive_cluster(&empty[wg_idx][stage], tid);
                 ++stage;
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++stage) {
                 if (stage == STAGES) {stage = 0; p ^= 1; };
-                wait(&full[stage], p);
+                wait(&full[wg_idx][stage], p);
                 warpgroup_arrive();
                 #pragma unroll
                 for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + stage*BLOCK_K*BLOCK_M + 64*(m_it + wg_idx*BLOCK_WG_M/WGMMA_M)*WGMMA_M;
-                    bf16 *wgmma_sB = sB + stage*BLOCK_K*BLOCK_N;
+                    bf16 *wgmma_sA = sA[wg_idx] + stage*BLOCK_K*BLOCK_WG_M + 64*m_it*WGMMA_M;
+                    bf16 *wgmma_sB = sB[wg_idx] + stage*BLOCK_K*BLOCK_N;
                     #pragma unroll
                     for (int bk = 0; bk < BLOCK_K; bk += 64) {
                         #pragma unroll
                         for (int k_it = 0; k_it < 64/WGMMA_K; ++k_it) {
                             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
                         }
-                        wgmma_sA += 64*BLOCK_M;
+                        wgmma_sA += 64*BLOCK_WG_M;
                         wgmma_sB += 64*BLOCK_N;
                     }
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                if (tid == 0) arrive(&empty[stage], 1);
+                if (tid < CLUSTERS) arrive_cluster(&empty[wg_idx][stage], tid);
             }
 
-            int lane = tid % 32, warp = tid / 32, row = warp*16 + lane / 4;
             // __nv_bfloat162* block_C = reinterpret_cast<__nv_bfloat162*>(C + num_block_m*BLOCK_M*N + num_block_n*BLOCK_N);
             bf16 *block_C = C + num_block_n*BLOCK_N*M + num_block_m*BLOCK_M;
-        
+
             #pragma unroll
             for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
                 int yo = m_it*WGMMA_M + wg_idx*BLOCK_WG_M;
-                if (row + yo + num_block_m*BLOCK_M >= M) continue;
+                if (row + 8 + yo + num_block_m*BLOCK_M >= M) continue;
                 #pragma unroll
-                for (int w = 0; w < WGMMA_N; w+=16) if (w < N-num_block_n*BLOCK_N) {
+                for (int w = 0; w < WGMMA_N; w+=16) if (w+num_block_n*BLOCK_N < N) {
                     // int col = 8*w + (tid % 4);
                     // #define IDX(i, j) ((((i) + yo)*N/2 + (j)))
-
                     // block_C[IDX(row, col)] = __halves2bfloat162(d[m_it][w][0], d[m_it][w][1]);
                     // block_C[IDX(row + 8, col)] = __halves2bfloat162(d[m_it][w][2], d[m_it][w][3]);
                     // block_C[IDX(row, col + 4)] = __halves2bfloat162(d[m_it][w][4], d[m_it][w][5]);
                     // block_C[IDX(row + 8, col + 4)] = __halves2bfloat162(d[m_it][w][6], d[m_it][w][7]);
                     // #undef IDX
-
                     int col = w + 2*(tid % 4);
                     #define IDX(i, j) ((j)*M + ((i) + yo))
                     #define ST(i, j, v) __stwt(&block_C[IDX(i, j)], v);
@@ -589,7 +688,7 @@ void createHilbert(int M, int N, int CORES, int *space) {
         d2xy(dim, i, x, y);
         if (x < M && y < N) {
             assert(loc < SPACE_LEN);
-            assert(v[x][y] = '.');
+            assert(v[x][y] == '.');
             v[x][y] = '*';
             ++total;
             space[core*SPACE_LEN+loc] = ((x << 16) | y);
@@ -597,6 +696,15 @@ void createHilbert(int M, int N, int CORES, int *space) {
             if (core == CORES) {core = 0; loc++;}
         }
     }
+    // for (int i = 0; i < CORES; ++i) {
+    //     printf("%d: ", i);
+    //     for (int j = 0; j < SPACE_LEN; ++j) {
+    //         int value = space[i*SPACE_LEN+j];
+    //         if (value == -1) break;
+    //         printf("[%d,%d] ", value>>16, value&((1<<16)-1));
+    //     }
+    //     printf("\n");
+    // }
     assert(total == M*N);
     // for (int i = 0; i < dim; ++i) {
     //     std::cout << v[i] << std::endl;
@@ -604,30 +712,34 @@ void createHilbert(int M, int N, int CORES, int *space) {
 }
 
 // Factor: 2263.915771, Times: 4096, Load: 1641.335504, Compute: 1189.903631,  Store: 9115.878662
-void runKernel6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
-    constexpr int BLOCK_M = 128;
-    constexpr int BLOCK_N = 256;
+void runKernel9(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+    constexpr int BLOCK_M = 256;
+    constexpr int BLOCK_N = 192;
     constexpr int BLOCK_K = 64;
     constexpr int NUM_THREADS = 128*3;
-    constexpr int STAGES = 3;
+    constexpr int NUM_WG = NUM_THREADS / 128 - 1;
+    constexpr int STAGES = 2;
+    constexpr int CLUSTER_M = 2;
+    constexpr int CLUSTER_N = 1;
     constexpr int NUM_SM = 128;
+    static_assert(NUM_SM % (CLUSTER_M*CLUSTER_N) == 0);
 
     if (_prev_m != M) {
-        d_tma_map_A = create_tensor_map<BLOCK_M, BLOCK_K>(A, M, K);
+        d_tma_map_A = create_tensor_map<BLOCK_M/NUM_WG, BLOCK_K>(A, M, K);
         d_tma_map_B = create_tensor_map<BLOCK_N, BLOCK_K>(B, N, K);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
         int *space;
         space = (int*)malloc(sizeof(int)*NUM_SM*SPACE_LEN);
-        createHilbert(CEIL_DIV(M, BLOCK_M), CEIL_DIV(N, BLOCK_N), NUM_SM, space);
+        createHilbert(CEIL_DIV(M, BLOCK_M*CLUSTER_M), CEIL_DIV(N, BLOCK_N*CLUSTER_N), NUM_SM/CLUSTER_M/CLUSTER_N, space);
         cudaCheck(cudaMalloc((void **)&_dspace, sizeof(int)*NUM_SM*SPACE_LEN));
         cudaCheck(cudaMemcpy(_dspace, space, sizeof(int)*NUM_SM*SPACE_LEN, cudaMemcpyHostToDevice));
     }
     // Assert cached values are of same size
     assert (M == _prev_m && N == _prev_n && K == _prev_k);
-    auto* kernel = matmulKernel6<BLOCK_M, BLOCK_N, BLOCK_K, NUM_THREADS, STAGES, NUM_SM>;
-    size_t sMemSize = sizeof(SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES>);
+    auto* kernel = matmulKernel9<BLOCK_M, BLOCK_N, BLOCK_K, NUM_THREADS, STAGES, NUM_SM, CLUSTER_M, CLUSTER_N>;
+    size_t sMemSize = sizeof(SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES, NUM_WG>);
     cudaCheck(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
@@ -635,7 +747,6 @@ void runKernel6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, _dspace);
 }
     
-} // namespace M5
+} // namespace M9
 
-using M6::runKernel6;
-    
+using M9::runKernel9;

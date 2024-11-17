@@ -3,7 +3,8 @@
 We will compute `C(column major) = A(row major) * B(column major)` for square size matrices(M=N=K) with BF16 type and FP32 accumulators.
 We initialize elements by `normal_distribution(mean = 0, std_dev = 1)`.
 
-We perform better for some sizes, at par for some, and worse for some :)
+For N=4096, we are 9% faster than cuBLAS
+For N=8192, we are 1.5% faster than cuBLAS
 
 ## To run:
 ```
@@ -41,81 +42,76 @@ Example kernels are in [`examples/matmul/`](https://github.com/pranjalssh/fast.c
     * Grouping by m-dimension is better than n-dimension(??).
     * We also switch from 3->2 consumer warpgroups: 128x256 ThreadBlock size with m64n256k16 WGMMA. Using more warpgroups is harmful(maybe because more synchronization is needed?)
     * Performance drops to 60% when using clusters of size > 2. Looks like mbarrier synchronization is too slow for this?
+* Kernel 11:
+    * Use hilbert curve for scheduling output blocks(better cache locality)
+    * Use TMA Stores for writing results back to GMEM
 
 
 
-0 is baseline. 6, 7 are the best ones of the handwritten.
+
+0 is cuBLAS baseline. 11 is the best handwritten version
 
 ## Benchmarks
 
 Run on H100 SXM.
 
-N=2048*3: Kernel 7 is best.
+N=2048*4: Kernel 11 is best(808 TFLOPs) 1.5% faster than cuBLAS
 ```
 KERNEL 0
-Average elapsed time: (0.000627) s, performance: (  739.8) TFLOPS. size: (6144).
+Average elapsed time: (0.001378) s, performance: (  797.8) TFLOPS. size: (8192).
 
 KERNEL 1
-Average elapsed time: (0.014328) s, performance: (   32.4) TFLOPS. size: (6144).
+Average elapsed time: (0.033970) s, performance: (   32.4) TFLOPS. size: (8192).
 
 KERNEL 2
-Average elapsed time: (0.000972) s, performance: (  477.5) TFLOPS. size: (6144).
+Average elapsed time: (0.002251) s, performance: (  488.5) TFLOPS. size: (8192).
 
 KERNEL 4
-Average elapsed time: (0.000714) s, performance: (  649.8) TFLOPS. size: (6144).
+Average elapsed time: (0.001731) s, performance: (  635.4) TFLOPS. size: (8192).
 
 KERNEL 5
-Average elapsed time: (0.000739) s, performance: (  627.9) TFLOPS. size: (6144).
+Average elapsed time: (0.001670) s, performance: (  658.4) TFLOPS. size: (8192).
 
 KERNEL 6
-Average elapsed time: (0.000613) s, performance: (  756.2) TFLOPS. size: (6144).
-
-***
-KERNEL 7
-Average elapsed time: (0.000603) s, performance: (  769.3) TFLOPS. size: (6144).
-***
-```
-
-N=2048*4: Kernels 0/7 are similar.
-```
-KERNEL 0
-Average elapsed time: (0.001385) s, performance: (  794.1) TFLOPS. size: (8192).
+Average elapsed time: (0.001414) s, performance: (  777.5) TFLOPS. size: (8192).
 
 KERNEL 7
-Average elapsed time: (0.001396) s, performance: (  787.5) TFLOPS. size: (8192).
+Average elapsed time: (0.001376) s, performance: (  799.1) TFLOPS. size: (8192).
+
+KERNEL 11
+Average elapsed time: (0.001361) s, performance: (  807.7) TFLOPS. size: (8192).
 ```
 
-N=2048*6: Kernel 0 is best.
-```
-***
+N=2048*3: Kernel 11 is best(794.5 TFLOPs) 7% faster than cuBLAS
 KERNEL 0
-Average elapsed time: (0.004555) s, performance: (  814.6) TFLOPS. size: (12288).
-***
+Average elapsed time: (0.000626) s, performance: (  741.1) TFLOPS. size: (6144).
 
 KERNEL 1
-Average elapsed time: (0.111039) s, performance: (   33.4) TFLOPS. size: (12288).
+Average elapsed time: (0.014438) s, performance: (   32.1) TFLOPS. size: (6144).
 
 KERNEL 2
-Average elapsed time: (0.007472) s, performance: (  496.6) TFLOPS. size: (12288).
+Average elapsed time: (0.000973) s, performance: (  476.6) TFLOPS. size: (6144).
 
 KERNEL 4
-Average elapsed time: (0.006013) s, performance: (  617.1) TFLOPS. size: (12288).
+Average elapsed time: (0.000712) s, performance: (  651.2) TFLOPS. size: (6144).
 
 KERNEL 5
-Average elapsed time: (0.005571) s, performance: (  666.1) TFLOPS. size: (12288).
+Average elapsed time: (0.000741) s, performance: (  625.8) TFLOPS. size: (6144).
 
 KERNEL 6
-Average elapsed time: (0.004770) s, performance: (  777.9) TFLOPS. size: (12288).
+Average elapsed time: (0.000605) s, performance: (  766.3) TFLOPS. size: (6144).
 
 KERNEL 7
-Average elapsed time: (0.004879) s, performance: (  760.6) TFLOPS. size: (12288).
+Average elapsed time: (0.000599) s, performance: (  774.4) TFLOPS. size: (6144).
+
+KERNEL 11
+Average elapsed time: (0.000584) s, performance: (  794.5) TFLOPS. size: (6144).
 ```
 
-## More Things to do:
-* I haven't been able to use TMA loads of MxK with K > 64. M can vary till 256, but tensor map fails to create for K > 64 for any value of M. Need to dig more into cutlass to see how to do it.
-* profiler says global accesses only utilize 50% bus width :((
-* Better Tile scheduling(one that can use all SMs?). Hilbert curves aren't better than current scheduling.
+
+## More Ideas to try:
+* Better Tile scheduling. one that can use all SMs
 * In A100/H100 L2 cache is split into 2 parts, reading from the "nearer" partition can speed up memory accesses. Is this worth reverse engineering and trying?
 * Try reducing L2 cache size using L2 setaside feature - and see if it reduces power usage of kernel.
-* ...
+* Try vectorizing shared memory stores using __shfl operations
 

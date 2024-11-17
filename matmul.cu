@@ -29,11 +29,15 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 
 #include "examples/matmul/matmul_1.cuh"
 #include "examples/matmul/matmul_2.cuh"
-#include "examples/matmul/matmul_3.cuh"
+// #include "examples/matmul/matmul_3.cuh"
 #include "examples/matmul/matmul_4.cuh"
 #include "examples/matmul/matmul_5.cuh"
 #include "examples/matmul/matmul_6.cuh"
 #include "examples/matmul/matmul_7.cuh"
+#include "examples/matmul/matmul_8.cuh"
+#include "examples/matmul/matmul_9.cuh"
+#include "examples/matmul/matmul_10.cuh"
+#include "examples/matmul/matmul_11.cuh"
 
 std::default_random_engine generator(69);
 cublasHandle_t cublas_handle;
@@ -60,9 +64,9 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
     case 2:
       runKernel2(M, N, K, A, B, C);
       break;
-    case 3:
-      runKernel3(M, N, K, A, B, C, DB);
-      break;
+    // case 3:
+    //   runKernel3(M, N, K, A, B, C, DB);
+    //   break;
     case 4:
       runKernel4(M, N, K, A, B, C, DB);
       break;
@@ -74,6 +78,18 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
       break;
     case 7:
       runKernel7(M, N, K, A, B, C, DB);
+      break;
+    case 8:
+      runKernel8(M, N, K, A, B, C, DB);
+      break;
+    case 9:
+      runKernel9(M, N, K, A, B, C, DB);
+      break;
+    case 10:
+      runKernel10(M, N, K, A, B, C, DB);
+      break;
+    case 11:
+      runKernel11(M, N, K, A, B, C, DB);
       break;
   }
 }
@@ -90,6 +106,8 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
+    int r = i / 8192, c = i % 8192;
+    int it = c*8192+r;
     diff = std::fabs(__bfloat162float(matRef[i] - matOut[i]));
     if (diff > 0.1) {
       printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
@@ -107,7 +125,6 @@ __global__ void warmupKernel() {
 
 int main() {
   warmupKernel<<<1024, 1024>>>();
-  cudaDeviceSynchronize();
 
   cublasCreate(&cublas_handle);
   float elapsed_time;
@@ -115,7 +132,7 @@ int main() {
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  long max_size = 4096*3;
+  long max_size = 2048*4;
   long m = max_size, n = max_size, k = max_size;
 
   bf16 *A = nullptr, *B = nullptr, *C = nullptr,
@@ -148,7 +165,8 @@ int main() {
 
   int repeat_times = 8;
   bool run_verif = true;
-  for (int kernel_num : {0, 1, 2, /*3,*/ 4, 5, 6, 7}) {
+  for (int kernel_num : {0, 1, 2, 4, 5, 6, 7, 11}) {
+    sleep(5);
     std::cout << "KERNEL " << kernel_num << std::endl;
     // Verify against cuBLAS. Also serves as a warmup step.
     if (run_verif) {
@@ -167,6 +185,7 @@ int main() {
 
       if (kernel_num > 1 && !verify_matrix(C_ref, C, m * n)) {
         std::cout << "~~~~~~~~~~~~~~~~ Failed to pass the correctness verification against cuBLAS. ~~~~~~~~~~~~~~~~" << std::endl;
+        printf("%f\n", __bfloat162float(C_ref[m]));
       }
 
       cudaMemcpy(DB, dDB, sizeof(int) * max_size * 8, cudaMemcpyDeviceToHost);
@@ -196,7 +215,6 @@ int main() {
     // Benchmark
     cudaEventRecord(start);
     for (int j = 0; j < repeat_times; j++) {
-      // We don't reset dC between runs to save time
       run_kernel(kernel_num, m, n, k, dA, dB, dC);
     }
     cudaEventRecord(stop);

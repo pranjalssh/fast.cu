@@ -378,10 +378,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  matmulKernel4(int M, int N, int
 
 
 void runKernel4(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
-    constexpr int BLOCK_M = 64*3;
-    constexpr int BLOCK_N = 192;
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 256;
     constexpr int BLOCK_K = 64;
-    constexpr int NUM_THREADS = 128*4;
+    constexpr int NUM_THREADS = 128*3;
     constexpr int STAGES = 3;
 
     if (!d_tma_map_A) {
