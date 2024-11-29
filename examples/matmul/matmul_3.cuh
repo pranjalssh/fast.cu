@@ -259,29 +259,29 @@ __device__ inline void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
         wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
 }
 
-template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+template <int BM, int BN, int BK>
 struct SMem {
-    alignas(128) bf16 A[BLOCK_M*BLOCK_K];
-    alignas(128) bf16 B[BLOCK_K*BLOCK_N];
+    alignas(128) bf16 A[BM*BK];
+    alignas(128) bf16 B[BK*BN];
 };
 
-template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int NUM_THREADS, bool DBG>
+template<int BM, int BN, int BK, int NUM_THREADS, bool DBG>
 __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K, bf16* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB, int *DB) {
-    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BLOCK_N;
-    constexpr int BLOCK_WG_M = BLOCK_M / (NUM_THREADS / 128);
-    extern __shared__ SMem<BLOCK_M, BLOCK_N, BLOCK_K> s;
+    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
+    constexpr int B_WG_M = BM / (NUM_THREADS / 128);
+    extern __shared__ SMem<BM, BN, BK> s;
     bf16 *sA = s.A;
     bf16 *sB = s.B;
     // Barriers cannot be in the struct and have to be declared this way
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ barrier barA, barB;
-    float d[BLOCK_WG_M/WGMMA_M][WGMMA_N/16][8];
-    static_assert(sizeof(d) * NUM_THREADS == BLOCK_M * BLOCK_N * sizeof(float));
+    float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
+    static_assert(sizeof(d) * NUM_THREADS == BM * BN * sizeof(float));
     memset(d, 0, sizeof(d));
 
-    const int num_blocks_k = K / BLOCK_K;
-    int num_block_n = blockIdx.x % (N / BLOCK_N);
-    int num_block_m = blockIdx.x / (N / BLOCK_N);
+    const int num_blocks_k = K / BK;
+    int num_block_n = blockIdx.x % (N / BN);
+    int num_block_m = blockIdx.x / (N / BN);
 
     if (threadIdx.x == 0) {
         init(&barA, blockDim.x);
@@ -299,10 +299,10 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
         clock_t start = clock();
         // Load
         if (threadIdx.x == 0) {
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, block_k_iter*BLOCK_K, num_block_m*BLOCK_M, barA);
-            tokenA = cuda::device::barrier_arrive_tx(barA, 1, BLOCK_K*BLOCK_M*sizeof(bf16));
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, block_k_iter*BLOCK_K, num_block_n*BLOCK_N, barB);
-            tokenB = cuda::device::barrier_arrive_tx(barB, 1, BLOCK_K*BLOCK_N*sizeof(bf16));
+            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, block_k_iter*BK, num_block_m*BM, barA);
+            tokenA = cuda::device::barrier_arrive_tx(barA, 1, BK*BM*sizeof(bf16));
+            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, block_k_iter*BK, num_block_n*BN, barB);
+            tokenB = cuda::device::barrier_arrive_tx(barB, 1, BK*BN*sizeof(bf16));
         } else {
             tokenA = barA.arrive();
             tokenB = barB.arrive();
@@ -319,10 +319,10 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
         // Compute
         warpgroup_arrive();
         #pragma unroll
-        for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-            bf16 *wgmma_sA = sA + BLOCK_K*(m_it + wg_idx*BLOCK_WG_M/WGMMA_M)*WGMMA_M;
+        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            bf16 *wgmma_sA = sA + BK*(m_it + wg_idx*B_WG_M/WGMMA_M)*WGMMA_M;
             #pragma unroll
-            for (int k_it = 0; k_it < BLOCK_K/WGMMA_K; ++k_it) {
+            for (int k_it = 0; k_it < BK/WGMMA_K; ++k_it) {
                 wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &sB[k_it*WGMMA_K]);
             }
         }
@@ -344,34 +344,24 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
         uint32_t warp = tid / 32;
         uint32_t row = warp*16 + lane / 4;
 
-        // __nv_bfloat162* block_C = reinterpret_cast<__nv_bfloat162*>(C + num_block_m*BLOCK_M*N + num_block_n*BLOCK_N);
-        bf16 *block_C = C + num_block_n*BLOCK_N*M + num_block_m*BLOCK_M;
+        bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
 
         #pragma unroll
-        for (uint32_t m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-            int yo = m_it*WGMMA_M + wg_idx*BLOCK_WG_M;
+        for (uint32_t m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
             #pragma unroll
             for (uint32_t w = 0; w < WGMMA_N/16; ++w) {
-                // int col = 8*w + (tid % 4);
-                // #define IDX(i, j) ((((i) + yo)*N/2 + (j)))
-                // block_C[IDX(row, col + 4)] = __halves2bfloat162(d[m_it][w][4], d[m_it][w][5]);
-                // block_C[IDX(row, col)] = __halves2bfloat162(d[m_it][w][0], d[m_it][w][1]);
-                
-                // block_C[IDX(row + 8, col + 4)] = __halves2bfloat162(d[m_it][w][6], d[m_it][w][7]);
-                // block_C[IDX(row + 8, col)] = __halves2bfloat162(d[m_it][w][2], d[m_it][w][3]);
-                
-                // #undef IDX
                 int col = 16*w + 2*(tid % 4);
                 #define IDX(i, j) ((j)*M + ((i) + yo))
 
-                __stwt(&block_C[IDX(row, col)], d[m_it][w][0]);
-                __stwt(&block_C[IDX(row+8, col)], d[m_it][w][2]);
-                __stwt(&block_C[IDX(row, col+1)], d[m_it][w][1]);
-                __stwt(&block_C[IDX(row+8, col+1)], d[m_it][w][3]);
-                __stwt(&block_C[IDX(row, col+8)], d[m_it][w][4]);
-                __stwt(&block_C[IDX(row+8, col+8)], d[m_it][w][6]);
-                __stwt(&block_C[IDX(row, col+9)], d[m_it][w][5]);
-                __stwt(&block_C[IDX(row+8, col+9)], d[m_it][w][7]);
+                block_C[IDX(row, col)] = d[m_it][w][0];
+                block_C[IDX(row, col+1)] = d[m_it][w][1];
+                block_C[IDX(row+8, col)] = d[m_it][w][2];
+                block_C[IDX(row+8, col+1)] = d[m_it][w][3];
+                block_C[IDX(row, col+8)] = d[m_it][w][4];
+                block_C[IDX(row, col+9)] = d[m_it][w][5];
+                block_C[IDX(row+8, col+8)] = d[m_it][w][6];
+                block_C[IDX(row+8, col+9)] = d[m_it][w][7];
                 
                 #undef IDX
             }
@@ -391,28 +381,28 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel3(int M, int N, int K
 
 
 void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
-    constexpr int BLOCK_M = 64*2;
-    constexpr int BLOCK_N = 256;
-    constexpr int BLOCK_K = 64;
-    constexpr int NUM_THREADS = 128*2;
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int NUM_THREADS = 128;
 
     if (!d_tma_map_A) {
-        d_tma_map_A = allocate_and_create_tensor_map<BLOCK_M, BLOCK_K>(A, M / BLOCK_M, K / BLOCK_K);
-        d_tma_map_B = allocate_and_create_tensor_map<BLOCK_N, BLOCK_K>(B, N / BLOCK_N, K / BLOCK_K);
+        d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
+        d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
     }
     // Assert cached values are of same size
     assert (M == _prev_m && N == _prev_n && K == _prev_k);
-    auto* kernel = DB ? matmulKernel3<BLOCK_M, BLOCK_N, BLOCK_K, NUM_THREADS, true>
-            : matmulKernel3<BLOCK_M, BLOCK_N, BLOCK_K, NUM_THREADS, false>;
-    size_t sMemSize = sizeof(SMem<BLOCK_M, BLOCK_N, BLOCK_K>);
+    auto* kernel = DB ? matmulKernel3<BM, BN, BK, NUM_THREADS, true>
+            : matmulKernel3<BM, BN, BK, NUM_THREADS, false>;
+    size_t sMemSize = sizeof(SMem<BM, BN, BK>);
     cudaCheck(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<(M/BLOCK_M) * (N/BLOCK_N), NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, DB);
+    kernel<<<(M/BM) * (N/BN), NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, DB);
 }
 
 } // namespace M3

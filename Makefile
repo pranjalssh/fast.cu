@@ -16,7 +16,7 @@ NCU_COMMAND = sudo $(NCU_PATH) --set full --import-source yes
 
 NVCC_FLAGS += --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -Xcompiler=-fPIE -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing
 # NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
-# NVCC_FLAGS += --ptxas-options=-v,--register-usage-level=10
+# NVCC_FLAGS += --ptxas-options=-v #,--register-usage-level=10
 # NVCC_FLAGS += -gencode arch=compute_90a,code=sm_90a -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills
 NVCC_FLAGS += -arch=sm_90a
 
@@ -32,15 +32,6 @@ matmul: matmul.cu
 	$(NVCC_BASE) $^ $(CUDA_OUTPUT_FILE)
 
 matmulprofile: matmul
-	$(NCU_COMMAND) -o $@ -f $(OUT_DIR)/$^
-
-wgmma2: examples/wgmma2.cu
-	$(NVCC_BASE) $^ $(CUDA_OUTPUT_FILE)
-
-ref: examples/ref.cu
-	$(NVCC_BASE) $^ $(CUDA_OUTPUT_FILE)
-
-wgmmaprofile: wgmma
 	$(NCU_COMMAND) -o $@ -f $(OUT_DIR)/$^
 
 clean:

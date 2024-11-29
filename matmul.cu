@@ -29,7 +29,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 
 #include "examples/matmul/matmul_1.cuh"
 #include "examples/matmul/matmul_2.cuh"
-// #include "examples/matmul/matmul_3.cuh"
+#include "examples/matmul/matmul_3.cuh"
 #include "examples/matmul/matmul_4.cuh"
 #include "examples/matmul/matmul_5.cuh"
 #include "examples/matmul/matmul_6.cuh"
@@ -64,9 +64,9 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
     case 2:
       runKernel2(M, N, K, A, B, C);
       break;
-    // case 3:
-    //   runKernel3(M, N, K, A, B, C, DB);
-    //   break;
+    case 3:
+      runKernel3(M, N, K, A, B, C, DB);
+      break;
     case 4:
       runKernel4(M, N, K, A, B, C, DB);
       break;
@@ -132,7 +132,7 @@ int main() {
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  long max_size = 2048*4;
+  long max_size = 8192;
   long m = max_size, n = max_size, k = max_size;
 
   bf16 *A = nullptr, *B = nullptr, *C = nullptr,
@@ -165,7 +165,9 @@ int main() {
 
   int repeat_times = 8;
   bool run_verif = true;
-  for (int kernel_num : {0, 1, 2, 4, 5, 6, 7, 11}) {
+  for (int kernel_num : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}) {
+    // for (int kernel_num : {0, 11}) {
+    // Give the GPU some rest to avoid thermal throttling
     sleep(5);
     std::cout << "KERNEL " << kernel_num << std::endl;
     // Verify against cuBLAS. Also serves as a warmup step.
@@ -201,13 +203,9 @@ int main() {
         sumStore += DB[i + 4], cntStore += DB[i + 5];
         i += 6;
         times++;
-        // printf("Times: %d, Load: %f, Compute: %f,  Store: %f\n", times, (DB[i] + .0) / DB[i+1], (DB[i+2] + .0) / DB[i+3], (DB[i+4] + .0) / DB[i+5]);
       }
       if (times > 0) {
-        float factor = ((sumLoad + .0) / cntLoad + (sumCompute + .0) / cntCompute) * (k / 64);
-        factor += (sumStore + .0) / cntStore;
-        factor *= times / 1e6;
-        printf("Factor: %f, Times: %d, Load: %f, Compute: %f,  Store: %f\n", factor, times, (sumLoad + .0) / cntLoad, (sumCompute + .0) / cntCompute, (sumStore + .0) / cntStore);
+        printf("Load: %f, Compute: %f,  Store: %f, Datapoints: %d\n", (sumLoad + .0) / cntLoad, (sumCompute + .0) / cntCompute, (sumStore + .0) / cntStore, times);
       }
 
     }

@@ -1,7 +1,7 @@
 
 namespace M6 {
 
-// using barrier = cuda::barrier<cuda::thread_scope_block>;
+using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
@@ -32,28 +32,31 @@ __device__ void warpgroup_wait() {
 }
 
 template <int BlockMajorSize, int BlockMinorSize>
-__host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
-    CUtensorMap tma_map;
+void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, int blocks_width) {
     void* gmem_address = (void*)gmem_ptr;
-    static_assert(BlockMinorSize >= 64);
-    assert(global_width % 64 == 0);
-    uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
-    uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 64*sizeof(bf16), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
+    uint64_t gmem_prob_shape[5] = {(uint64_t)BlockMinorSize*blocks_width, (uint64_t)BlockMajorSize*blocks_height, 1, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16), sizeof(bf16) * BlockMinorSize*blocks_width, 0, 0, 0};
+    uint32_t smem_box_shape[5] = {uint32_t(BlockMinorSize), uint32_t(BlockMajorSize), 1, 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
-        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address, gmem_prob_shape,
-        gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, gmem_address, gmem_prob_shape,
+        gmem_prob_stride + 1, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
     assert(result == CUDA_SUCCESS);
-    return tma_map;
 }
 
 CUtensorMap d_tma_map_A;
 CUtensorMap d_tma_map_B;
 int _prev_m=0, _prev_n=0, _prev_k=0;
+
+template<int st_rows, int st_cols>
+__host__ static inline CUtensorMap allocate_and_create_tensor_map(bf16* src, int blocks_height, int blocks_width) {
+    CUtensorMap tma_map_host;
+    create_tensor_map<st_rows, st_cols>(&tma_map_host, src, blocks_height, blocks_width);
+    return tma_map_host;
+}
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
@@ -236,10 +239,10 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB
         wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
-template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES>
+template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
-    alignas(128) bf16 A[BLOCK_M*BLOCK_K*STAGES];
-    alignas(128) bf16 B[BLOCK_K*BLOCK_N*STAGES];
+    alignas(128) bf16 A[BM*BK*QSIZE];
+    alignas(128) bf16 B[BK*BN*QSIZE];
 };
 
 template <uint32_t RegCount>
@@ -252,74 +255,15 @@ __device__ void warpgroup_reg_dealloc() {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
-__device__ static __forceinline__ void init_barrier(uint64_t* bar, int thread_count, int transaction_count) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
-    asm volatile (
-        "mbarrier.init.shared::cta.b64 [%0], %1;\n"
-        :: "r"(bar_ptr), "r"(thread_count+transaction_count)
-    );
-}
-
-__device__ static __forceinline__ void expect_bytes(uint64_t* bar, uint32_t bytes) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
-    asm volatile ("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-        :: "r"(bar_ptr), "r"(bytes));
-}
-
-__device__ static inline void load_async(bf16 *dst, void const* const src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
-    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-    asm volatile (
-        "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
-        :
-        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
-        "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
-        : "memory"
-    );
-}
-
-__device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
-    asm volatile (
-        "{\n"
-        ".reg .pred                P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-        "@P1                       bra.uni DONE;\n"
-        "bra.uni                   LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        :: "r"(mbar_ptr),
-        "r"(kPhaseBit)
-    );
-}
-
-__device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
-    asm volatile (
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
-        :
-        : "r"(mbar_ptr), "r"(count)
-        : "memory"
-    );
-}
-
-template<int VERSION, int NUM_SM, int BLOCK_M, int BLOCK_N, int TM, int TN>
+template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
-constexpr int SPACE_LEN = 128;
-int *_dspace;
-
-template<int NUM_SM, int BLOCK_M, int BLOCK_N, int TM, int TN>
-struct Schedule<0, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
+template<int NUM_SM, int BM, int BN, int TM, int TN>
+struct Schedule<0, NUM_SM, BM, BN, TM, TN> {
     int st, en;
-    int blocks_n;
 
-    __device__ __forceinline__ Schedule(int M, int N, int block, int *space) {
-        int total_blocks = M*N/(BLOCK_M*BLOCK_N);
+    __device__ __forceinline__ Schedule(int M, int N, int block) {
+        int total_blocks = M*N/(BM*BN);
         int blocks_per_sm = total_blocks / NUM_SM;
         int extra_blocks = total_blocks % NUM_SM;
         if (block < extra_blocks) {
@@ -329,313 +273,178 @@ struct Schedule<0, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
             st = extra_blocks + block*blocks_per_sm;
             en = st + blocks_per_sm;
         }
-        blocks_n = CEIL_DIV(N, BLOCK_N);
     }
 
-    __device__ __forceinline__ bool next(int &block_m, int& block_n) {
-        if (en == st) {
-            return false;
-        }
-        block_m = st / blocks_n;
-        block_n = st % blocks_n; 
-        st += 1;
-        return true;
+    __device__ __forceinline__ int next() {
+        if (en == st) return -1;
+        return st++;
     }
 };
 
-template<int NUM_SM, int BLOCK_M, int BLOCK_N, int TM, int TN>
-struct Schedule<1, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
+template<int NUM_SM, int BM, int BN, int TM, int TN>
+struct Schedule<1, NUM_SM, BM, BN, TM, TN> {
     int block;
     int it;
-    int total_blocks_m, total_blocks_n;
+    int total_blocks_m;
+    int total_blocks_n;
 
-    __device__ __forceinline__ Schedule(int M, int N, int _block, int *space) {
+    __device__ __forceinline__ Schedule(int M, int N, int _block) {
         block = _block;
         it = 0;
-        total_blocks_m = CEIL_DIV(M, BLOCK_M);
-        total_blocks_n = CEIL_DIV(N, BLOCK_N);
-        assert(CEIL_DIV(M, BLOCK_M)%TM == 0 && total_blocks_n%TN == 0);
+        total_blocks_m = M/BM;
+        total_blocks_n = N/BN;
+        assert(total_blocks_m%TM == 0 && total_blocks_n%TN == 0);
     }
 
-    __device__ __forceinline__ bool next(int &block_m, int& block_n) {
+    __device__ __forceinline__ int next() {
         int num = it*NUM_SM + block;
-        if (num >= total_blocks_m*total_blocks_n) {return false;}
+        if (num >= total_blocks_m*total_blocks_n) return -1;
         
         int cur_tile = num / (TM*TN);
         int cur_tile_pos = num % (TM*TN);
-        block_m = TM*(cur_tile / (total_blocks_n/TN));
-        block_n = TN*(cur_tile % (total_blocks_n/TN));
-        block_m += cur_tile_pos / TN;
-        block_n += cur_tile_pos % TN;
+        int m = TM*(cur_tile / (total_blocks_n/TN));
+        int n = TN*(cur_tile % (total_blocks_n/TN));
+        m += cur_tile_pos / TN;
+        n += cur_tile_pos % TN;
         ++it;
-        return true;
+        return m*total_blocks_n + n;
     }
 };
 
-template<int NUM_SM, int BLOCK_M, int BLOCK_N, int TM, int TN>
-struct Schedule<2, NUM_SM, BLOCK_M, BLOCK_N, TM, TN> {
-    int it;
-    int *space;
-
-    __device__ __forceinline__ Schedule(int M, int N, int block, int *_space) {
-        it = 0;
-        space = _space;
-    }
-
-    __device__ __forceinline__ bool next(int &block_m, int& block_n) {
-        if (it == SPACE_LEN) {
-            return false;
-        }
-        int now = space[it];
-        if (now == -1) {
-            return false;
-        }
-        block_m = now >> 16;
-        block_n = (now & ((1<<16)-1));
-        ++it;
-        return true;
-    }
-};
-
-template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int NUM_THREADS, int STAGES, int NUM_SM>
-__global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int *dspace) {
-    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BLOCK_N;
+template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM>
+__global__  __launch_bounds__(NUM_THREADS) void  matmulKernel6(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
+    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
-    constexpr int BLOCK_WG_M = BLOCK_M / num_consumers;
+    constexpr int B_WG_M = BM / num_consumers;
 
     extern __shared__ __align__(128) uint8_t smem[];
-    SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES> &s = *reinterpret_cast<SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES>*>(smem);
+    SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
     bf16 *sA = s.A;
     bf16 *sB = s.B;
-    // Declare barriers
-    __shared__ __align__(8) uint64_t full[STAGES], empty[STAGES];
-    __shared__ int space[SPACE_LEN];
-    if (threadIdx.x < SPACE_LEN) space[threadIdx.x] = dspace[blockIdx.x*SPACE_LEN+threadIdx.x];
+    // Barriers cannot be in the struct and have to be declared this way
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ barrier full[QSIZE], empty[QSIZE];
 
-    const int num_blocks_k = K / BLOCK_K;
+    const int num_blocks_k = K / BK;
     int wg_idx = threadIdx.x / 128;
     int tid = threadIdx.x % 128;
 
     if (threadIdx.x == 0) {
-        for (int i = 0; i < STAGES; ++i) {
-            init_barrier(&full[i], 0, 1);
-            init_barrier(&empty[i], 0, num_consumers);
+        for (int i = 0; i < QSIZE; ++i) {
+            init(&full[i], num_consumers * 128 + 1);
+            init(&empty[i], num_consumers * 128 + 1);
         }
+        cde::fence_proxy_async_shared_cta();
     }
     __syncthreads();
 
-    Schedule<2, NUM_SM, BLOCK_M, BLOCK_N, 16, 8> schedule(M, N, blockIdx.x, space);
+    Schedule<1, NUM_SM, BM, BN, 16, 8> schedule(M, N, blockIdx.x);
 
     // Producer
     if (wg_idx == 0) {
         constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
         warpgroup_reg_dealloc<num_regs>();
         if (tid == 0) {
-            int p = 0;
-            int stage = 0;
-            int num_block_m, num_block_n;
-            while (schedule.next(num_block_m, num_block_n)) {
-                for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++stage) {
-                    if (stage == STAGES) { stage = 0; p ^= 1; }
-                    wait(&empty[stage], p);
-                    expect_bytes(&full[stage], (BLOCK_K*BLOCK_N+BLOCK_K*BLOCK_M)*sizeof(bf16));
-                    load_async(&sA[stage*BLOCK_K*BLOCK_M], &tensorMapA, &full[stage], block_k_iter*BLOCK_K, num_block_m*BLOCK_M);
-                    load_async(&sB[stage*BLOCK_K*BLOCK_N], &tensorMapB, &full[stage], block_k_iter*BLOCK_K, num_block_n*BLOCK_N);
+            int qidx = 0;
+            for (int num_block = schedule.next(); num_block >= 0; num_block = schedule.next()) {
+                int num_block_n = num_block % (N / BN);
+                int num_block_m = num_block / (N / BN);
+                
+                for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
+                    if (qidx == QSIZE) qidx = 0;
+                    empty[qidx].wait(empty[qidx].arrive());
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[qidx*BK*BM], &tensorMapA, block_k_iter*BK, num_block_m*BM, full[qidx]);
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[qidx*BK*BN], &tensorMapB, block_k_iter*BK, num_block_n*BN, full[qidx]);
+                    barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full[qidx], 1, (BK*BN+BK*BM)*sizeof(bf16));
                 }   
             }
         }
     } else {
         constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
         warpgroup_reg_alloc<num_regs>();
-        float d[BLOCK_WG_M/WGMMA_M][WGMMA_N/16][8];
+        float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
         --wg_idx;
-        for (int i = 0; i < STAGES; ++i) {
-            if (tid == 0) arrive(&empty[i], 1);
+        for (int i = 0; i < QSIZE; ++i) {
+            barrier::arrival_token _ = empty[i].arrive();
         }
-        int p = 0;
-        int stage = 0;
-        int num_block_m, num_block_n;
-        while (schedule.next(num_block_m, num_block_n)) {
-            {
-                if (stage == STAGES) {stage = 0; p ^= 1; };
-                wait(&full[stage], p);
+        int qidx = 0;
+        
+        for (int num_block = schedule.next(); num_block >= 0; num_block = schedule.next()) {
+            int num_block_n = num_block % (N / BN);
+            int num_block_m = num_block / (N / BN);
+            memset(d, 0, sizeof(d));
+            for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
+                if (qidx == QSIZE) qidx = 0;
+                full[qidx].wait(full[qidx].arrive());
                 warpgroup_arrive();
-                #pragma unroll
-                for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + stage*BLOCK_K*BLOCK_M + 64*(m_it + wg_idx*BLOCK_WG_M/WGMMA_M)*WGMMA_M;
-                    bf16 *wgmma_sB = sB + stage*BLOCK_K*BLOCK_N;
-                    {
-                        wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
-                        #pragma unroll
-                        for (int k_it = 1; k_it < 64/WGMMA_K; ++k_it) {
-                            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
-                        }
-                        wgmma_sA += 64*BLOCK_M;
-                        wgmma_sB += 64*BLOCK_N;
-                    }
+                #pragma unroll    
+                for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+                    bf16 *wgmma_sA = sA + qidx*BK*BM + BK*(m_it + wg_idx*B_WG_M/WGMMA_M)*WGMMA_M;
                     #pragma unroll
-                    for (int bk = 64; bk < BLOCK_K; bk += 64) {
-                        #pragma unroll
-                        for (int k_it = 0; k_it < 64/WGMMA_K; ++k_it) {
-                            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
-                        }
-                        wgmma_sA += 64*BLOCK_M;
-                        wgmma_sB += 64*BLOCK_N;
+                    for (int k_it = 0; k_it < BK/WGMMA_K; ++k_it) {
+                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &sB[qidx*BK*BN + k_it*WGMMA_K]);
                     }
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                if (tid == 0) arrive(&empty[stage], 1);
-                ++stage;
-            }
-            for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++stage) {
-                if (stage == STAGES) {stage = 0; p ^= 1; };
-                wait(&full[stage], p);
-                warpgroup_arrive();
-                #pragma unroll
-                for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-                    bf16 *wgmma_sA = sA + stage*BLOCK_K*BLOCK_M + 64*(m_it + wg_idx*BLOCK_WG_M/WGMMA_M)*WGMMA_M;
-                    bf16 *wgmma_sB = sB + stage*BLOCK_K*BLOCK_N;
-                    #pragma unroll
-                    for (int bk = 0; bk < BLOCK_K; bk += 64) {
-                        #pragma unroll
-                        for (int k_it = 0; k_it < 64/WGMMA_K; ++k_it) {
-                            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it*WGMMA_K], &wgmma_sB[k_it*WGMMA_K]);
-                        }
-                        wgmma_sA += 64*BLOCK_M;
-                        wgmma_sB += 64*BLOCK_N;
-                    }
-                }
-                warpgroup_commit_batch();
-                warpgroup_wait<0>();
-                if (tid == 0) arrive(&empty[stage], 1);
+                barrier::arrival_token _ = empty[qidx].arrive();
             }
 
             int lane = tid % 32, warp = tid / 32, row = warp*16 + lane / 4;
-            // __nv_bfloat162* block_C = reinterpret_cast<__nv_bfloat162*>(C + num_block_m*BLOCK_M*N + num_block_n*BLOCK_N);
-            bf16 *block_C = C + num_block_n*BLOCK_N*M + num_block_m*BLOCK_M;
+            bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
         
             #pragma unroll
-            for (int m_it = 0; m_it < BLOCK_WG_M/WGMMA_M; ++m_it) {
-                int yo = m_it*WGMMA_M + wg_idx*BLOCK_WG_M;
-                if (row + yo + num_block_m*BLOCK_M >= M) continue;
+            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+                int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
                 #pragma unroll
-                for (int w = 0; w < WGMMA_N; w+=16) if (w < N-num_block_n*BLOCK_N) {
-                    // int col = 8*w + (tid % 4);
-                    // #define IDX(i, j) ((((i) + yo)*N/2 + (j)))
+                for (int w = 0; w < WGMMA_N/16; ++w) {
 
-                    // block_C[IDX(row, col)] = __halves2bfloat162(d[m_it][w][0], d[m_it][w][1]);
-                    // block_C[IDX(row + 8, col)] = __halves2bfloat162(d[m_it][w][2], d[m_it][w][3]);
-                    // block_C[IDX(row, col + 4)] = __halves2bfloat162(d[m_it][w][4], d[m_it][w][5]);
-                    // block_C[IDX(row + 8, col + 4)] = __halves2bfloat162(d[m_it][w][6], d[m_it][w][7]);
-                    // #undef IDX
-
-                    int col = w + 2*(tid % 4);
+                    int col = 16*w + 2*(tid % 4);
                     #define IDX(i, j) ((j)*M + ((i) + yo))
-                    #define ST(i, j, v) __stwt(&block_C[IDX(i, j)], v);
-                    
-                    ST(row, col, d[m_it][w/16][0]);
-                    ST(row, col+1, d[m_it][w/16][1]);
-                    ST(row+8, col, d[m_it][w/16][2]);
-                    ST(row+8, col+1, d[m_it][w/16][3]);
-                    ST(row, col+8, d[m_it][w/16][4]);
-                    ST(row, col+9, d[m_it][w/16][5]);
-                    ST(row+8, col+8, d[m_it][w/16][6]);
-                    ST(row+8, col+9, d[m_it][w/16][7]);
+
+                    block_C[IDX(row, col)] = d[m_it][w][0];
+                    block_C[IDX(row, col+1)] = d[m_it][w][1];
+                    block_C[IDX(row+8, col)] = d[m_it][w][2];
+                    block_C[IDX(row+8, col+1)] = d[m_it][w][3];
+
+                    block_C[IDX(row, col+8)] = d[m_it][w][4];
+                    block_C[IDX(row, col+9)] = d[m_it][w][5];
+                    block_C[IDX(row+8, col+8)] = d[m_it][w][6];
+                    block_C[IDX(row+8, col+9)] = d[m_it][w][7];
                     #undef IDX
-                    #undef ST
                 }
             }
         }
     }
 }
 
-// Rotate/flip quadrant appropriately
-void rot(int n, int& x, int& y, int rx, int ry) {
-    if (ry == 0) {
-        if (rx == 1) {
-            x = n-1 - x;
-            y = n-1 - y;
-        }
-        // Swap x and y
-        int t = x;
-        x = y;
-        y = t;
-    }
-}
-
-// Convert distance along curve to (x,y) point
-void d2xy(int n, int d, int& x, int& y) {
-    int rx, ry, s, t = d;
-    x = y = 0;
-    for (s = 1; s < n; s *= 2) {
-        rx = 1 & (t/2);
-        ry = 1 & (t ^ rx);
-        rot(s, x, y, rx, ry);
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-    }
-}
-
-void createHilbert(int M, int N, int CORES, int *space) {
-    int dim = (1 << (32 - __builtin_clz(max(M, N) - 1)));
-    int core = 0, loc = 0;
-    std::vector<std::string> v(dim, std::string(dim, '.'));
-    memset(space, -1, sizeof(int)*CORES*SPACE_LEN);
-    int total = 0;
-    for (int i = 0; i < dim*dim; ++i) {
-        int x, y;
-        d2xy(dim, i, x, y);
-        if (x < M && y < N) {
-            assert(loc < SPACE_LEN);
-            assert(v[x][y] = '.');
-            v[x][y] = '*';
-            ++total;
-            space[core*SPACE_LEN+loc] = ((x << 16) | y);
-            ++core;
-            if (core == CORES) {core = 0; loc++;}
-        }
-    }
-    assert(total == M*N);
-    // for (int i = 0; i < dim; ++i) {
-    //     std::cout << v[i] << std::endl;
-    // }
-}
-
-// Factor: 2263.915771, Times: 4096, Load: 1641.335504, Compute: 1189.903631,  Store: 9115.878662
 void runKernel6(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
-    constexpr int BLOCK_M = 128;
-    constexpr int BLOCK_N = 256;
-    constexpr int BLOCK_K = 64;
+    constexpr int BM = 128;
+    constexpr int BN = 256;
+    constexpr int BK = 64;
     constexpr int NUM_THREADS = 128*3;
-    constexpr int STAGES = 3;
+    constexpr int QSIZE = 3;
     constexpr int NUM_SM = 128;
 
     if (_prev_m != M) {
-        d_tma_map_A = create_tensor_map<BLOCK_M, BLOCK_K>(A, M, K);
-        d_tma_map_B = create_tensor_map<BLOCK_N, BLOCK_K>(B, N, K);
+        d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
+        d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
-        int *space;
-        space = (int*)malloc(sizeof(int)*NUM_SM*SPACE_LEN);
-        createHilbert(CEIL_DIV(M, BLOCK_M), CEIL_DIV(N, BLOCK_N), NUM_SM, space);
-        cudaCheck(cudaMalloc((void **)&_dspace, sizeof(int)*NUM_SM*SPACE_LEN));
-        cudaCheck(cudaMemcpy(_dspace, space, sizeof(int)*NUM_SM*SPACE_LEN, cudaMemcpyHostToDevice));
     }
     // Assert cached values are of same size
     assert (M == _prev_m && N == _prev_n && K == _prev_k);
-    auto* kernel = matmulKernel6<BLOCK_M, BLOCK_N, BLOCK_K, NUM_THREADS, STAGES, NUM_SM>;
-    size_t sMemSize = sizeof(SMem<BLOCK_M, BLOCK_N, BLOCK_K, STAGES>);
+    auto* kernel = matmulKernel6<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM>;
+    size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
     cudaCheck(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, _dspace);
+    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
 }
     
-} // namespace M5
+} // namespace M6
 
 using M6::runKernel6;
     
