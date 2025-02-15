@@ -38,6 +38,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 #include "examples/matmul/matmul_9.cuh"
 #include "examples/matmul/matmul_10.cuh"
 #include "examples/matmul/matmul_11.cuh"
+#include "examples/matmul/matmul_12.cuh"
 
 std::default_random_engine generator(69);
 cublasHandle_t cublas_handle;
@@ -90,6 +91,9 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
       break;
     case 11:
       runKernel11(M, N, K, A, B, C, DB);
+      break;
+    case 12:
+      runKernel12(M, N, K, A, B, C, DB);
       break;
   }
 }
@@ -165,7 +169,7 @@ int main() {
 
   int repeat_times = 8;
   bool run_verif = true;
-  for (int kernel_num : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}) {
+  for (int kernel_num : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}) {
     // for (int kernel_num : {0, 11}) {
     // Give the GPU some rest to avoid thermal throttling
     sleep(5);
