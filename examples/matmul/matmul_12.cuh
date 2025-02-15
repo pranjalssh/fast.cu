@@ -29,7 +29,7 @@ __device__ void warpgroup_wait() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
 
-template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
+template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, bool padding=false>
 __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
@@ -37,7 +37,7 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
     assert(global_width % 64 == 0);
     uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
     uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 64*sizeof(bf16), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
+    uint32_t smem_box_shape[5] = {padding ? 72 : 64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
@@ -300,31 +300,6 @@ __device__ static inline void load_async_multicast(bf16 *dst, void const* src_tm
     );
 }
 
-template<int BM, int BN, int B_WG_M, int WGMMA_M, int WGMMA_N>
-__device__ __forceinline__ void write_tile_tma(uint32_t base_addr, float *d, bf16* tma_src, void const* dst_tma_map, int m, int n, int tid, int wg_idx) {
-    if (m >= 0) {
-        bf16 d_bf16[8];
-        int4* data_ptr = (int4*)d_bf16;
-
-        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-            for (int w = 0; w < WGMMA_N; w+=16, d += 8) {
-                uint32_t addr = base_addr + (w*B_WG_M + m_it*WGMMA_M) * sizeof(bf16);
-                for (int k = 0; k < 8; k++) {
-                    d_bf16[k] = (bf16)(d[k]);
-                }
-                asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared::cta.b16 [%0], {%1, %2, %3, %4};"
-                             :: "r"(addr), "r"(data_ptr[0].x), "r"(data_ptr[0].y), "r"(data_ptr[0].z), "r"(data_ptr[0].w));
-            }
-        }
-        asm volatile("bar.sync %0, 128;\n" ::"r"(wg_idx + 2) : "memory");
-
-        if (tid == 0) {
-            store_async(dst_tma_map, tma_src, m*BM + wg_idx*B_WG_M, n*BN);
-            asm volatile("cp.async.bulk.commit_group;");
-        }
-    }
-}
-
 template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
@@ -360,16 +335,17 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM];
+    alignas(128) bf16 C[BN*(BM+(BM/64)*8)]; // padding of 8 elements per consumer
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
     int space[SPACE_LEN];
 };
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel12(int M, int N, int K, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
+    constexpr int B_WG_M_PADDED = B_WG_M + 8;
     constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
     assert((M / BM) % CLUSTER_M == 0);
     assert((N / BN) % CLUSTER_N == 0);
@@ -461,9 +437,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         // 1) 9.7.14.5.16 Warp-level matrix store instruction: stmatrix
         // 2) Figure 148: WGMMA .m64nNk16 register fragment layout for accumulator matrix D
         int lane = tid % 32, warp = tid / 32;
-        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-        uint32_t tid_offset = warp*16 + (lane % 8) * B_WG_M; // offset for x1 stmatrix
-        tid_offset += (lane/16)*B_WG_M*8 + (lane & 8); // row & column offsets for .x4 on stmatrix
+        bf16* block_sC = sC + wg_idx*B_WG_M_PADDED*BN;
+        uint32_t tid_offset = warp*16 + (lane % 8) * B_WG_M_PADDED; // offset for x1 stmatrix
+        tid_offset += (lane/16)*B_WG_M_PADDED*8 + (lane & 8); // row & column offsets for .x4 on stmatrix
         uint32_t base_addr = static_cast<uint32_t>(__cvta_generic_to_shared(block_sC)) + tid_offset * sizeof(bf16);
 
         while (schedule.next(num_block_m, num_block_n)) {
@@ -525,7 +501,24 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             }
 
             asm volatile("cp.async.bulk.wait_group 0;");
-            write_tile_tma<BM, BN, B_WG_M, WGMMA_M, WGMMA_N>(base_addr, (float*)d, block_sC, &tensorMapC, num_block_m, num_block_n, tid, wg_idx);
+
+            bf16 d_bf16[8];
+            int* data_ptr = (int*)d_bf16;
+            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+                for (int w = 0; w < WGMMA_N; w+=16) {
+                    uint32_t addr = base_addr + (w*B_WG_M_PADDED + m_it*WGMMA_M) * sizeof(bf16);
+                    for (int k = 0; k < 8; k++) {
+                        d_bf16[k] = (bf16)(d[m_it][w/16][k]);
+                    }
+                    asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared::cta.b16 [%0], {%1, %2, %3, %4};"
+                                :: "r"(addr), "r"(data_ptr[0]), "r"(data_ptr[1]), "r"(data_ptr[2]), "r"(data_ptr[3]));
+                }
+            }
+            asm volatile("bar.sync %0, 128;\n" ::"r"(wg_idx + 2) : "memory");
+            if (tid == 0) {
+                store_async(&tensorMapC, block_sC, num_block_m*BM + wg_idx*B_WG_M, num_block_n*BN);
+                asm volatile("cp.async.bulk.commit_group;");
+            }
         }
     }
 }
@@ -610,7 +603,7 @@ void runKernel12(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     if (_prev_m != M) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-        d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false>(C, N, M);
+        d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false, true>(C, N, M);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
@@ -622,7 +615,7 @@ void runKernel12(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     }
     // Assert cached values are of same size
     assert (M == _prev_m && N == _prev_n && K == _prev_k);
-    auto* kernel = matmulKernel11<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M, CLUSTER_N>;
+    auto* kernel = matmulKernel12<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M, CLUSTER_N>;
     constexpr size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
     static_assert(sMemSize < 256 * 1024);
     cudaCheck(cudaFuncSetAttribute(
