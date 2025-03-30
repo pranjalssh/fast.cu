@@ -150,7 +150,55 @@ __global__ void sumKernel3(int4 *d_in, int *d_out, int n) {
     }
 }
 
-const int NUM_KERNELS = 3;
+inline int __device__ warpReduce3(int sum) {
+    int sum_warp = 0;
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-redux-sync
+    // Use `redux.sync` to reduce within warp
+    asm volatile("redux.sync.add.s32 %0, %1, 0xff;" : "=r"(sum_warp) : "r"(sum));
+    return sum_warp;
+}
+
+template <int BlockSize, int Batch>
+__global__ void sumKernel4(int4 *d_in, int *d_out, int n) {
+    __shared__ __align__(16) int sdata[1];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x*BlockSize*Batch + tid;
+
+    if (i == 0) *d_out = 0;
+    if (tid == 0) sdata[0] = 0;
+
+    int4 value;
+    if (i < n) {
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
+        // Use `ld.global.cg` to bypass L1 cache
+        asm volatile("ld.global.cg.v4.s32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                 : "l"(&d_in[i]));
+    } else {
+        value = make_int4(0, 0, 0, 0);
+    }
+    int sum = value.x + value.y + value.z + value.w;
+    #pragma unroll
+    for (int j = 1; j < Batch; ++j) {
+        if (i + j*BlockSize < n) {
+            value = d_in[i + j*BlockSize];
+            sum += value.x + value.y + value.z + value.w;
+        }
+    }
+    // Sum within warps
+    sum = warpReduce3(sum);
+    __syncthreads();
+    if (tid % WARP_SIZE == 0) {
+        atomicAdd(&sdata[0], sum);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        atomicAdd(d_out, sdata[0]);
+    }
+}
+
+const int NUM_KERNELS = 4;
 const int NUM_KERNEL_RUNS = 100;
 const int NUM_STD_RUNS = NUM_KERNEL_RUNS;
 
@@ -165,6 +213,9 @@ void kernelDispatch(int kernelNum, int *d_in, int *d_out, int *h_out, int N) {
             break;
         case 3:
             sumKernel3<1024, 16><<<ceilDiv(N, 1024*4*16), 1024>>>(reinterpret_cast<int4*>(d_in), d_out, N/4);
+            break;
+        case 4:
+            sumKernel4<1024, 16><<<ceilDiv(N, 1024*4*16), 1024>>>(reinterpret_cast<int4*>(d_in), d_out, N/4);
             break;
     }
 }
