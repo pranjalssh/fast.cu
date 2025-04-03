@@ -17,6 +17,11 @@ Bandwidth: 3240.11 GB/s
 Time taken: 1.32556 ms
 Sum: 1609549285
 
+<---------------| kernel4 |--------------->
+Bandwidth: 3241.47 GB/s
+Time taken: 1.32501 ms
+Sum: 1609549285
+
 <---------------| cub |--------------->
 Bandwidth: 3193.36 GB/s
 Time taken: 1.34497 ms
@@ -168,16 +173,7 @@ __global__ void sumKernel4(int4 *d_in, int *d_out, int n) {
     if (i == 0) *d_out = 0;
     if (tid == 0) sdata[0] = 0;
 
-    int4 value;
-    if (i < n) {
-        // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
-        // Use `ld.global.cg` to bypass L1 cache
-        asm volatile("ld.global.cg.v4.s32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-                 : "l"(&d_in[i]));
-    } else {
-        value = make_int4(0, 0, 0, 0);
-    }
+    int4 value = i < n ? __ldcg(&d_in[i]) : make_int4(0, 0, 0, 0);
     int sum = value.x + value.y + value.z + value.w;
     #pragma unroll
     for (int j = 1; j < Batch; ++j) {
