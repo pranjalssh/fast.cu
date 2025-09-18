@@ -262,7 +262,7 @@ __device__ static __forceinline__ void init_barrier(uint64_t* bar, int thread_co
 
 __device__ static __forceinline__ void expect_bytes(uint64_t* bar, uint32_t bytes) {
     uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
-    asm volatile ("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+    asm volatile ("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
         :: "r"(bar_ptr), "r"(bytes));
 }
 
@@ -271,6 +271,7 @@ __device__ static inline void load_async(bf16 *dst, void const* const src_tma_ma
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
+    // TODO(aleksa): cluster -> cta reduces scope, and should thus improve perf - but requires PTX 8.6
     asm volatile (
         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
@@ -287,7 +288,7 @@ __device__ static __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
         "{\n"
         ".reg .pred                P1;\n"
         "LAB_WAIT:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
         "@P1                       bra.uni DONE;\n"
         "bra.uni                   LAB_WAIT;\n"
         "DONE:\n"
@@ -359,8 +360,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  matmulKernel7(int M, int N, int
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < QSIZE; ++i) {
-            init_barrier(&full[i], 0, 1);
-            init_barrier(&empty[i], 0, num_consumers);
+            init_barrier(&full[i], 1, 0);
+            init_barrier(&empty[i], num_consumers, 0);
         }
     }
     __syncthreads();
