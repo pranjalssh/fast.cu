@@ -471,7 +471,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         while (schedule.next(num_block_m, num_block_n)) {
             num_block_n = num_block_n * CLUSTER_N + rank_n;
             num_block_m = num_block_m * CLUSTER_M + rank_m;
-            memset(d, 0, sizeof(d));
             {
                 if (qidx == QSIZE) {qidx = 0; p ^= 1; };
                 wait(&full[qidx], p);
