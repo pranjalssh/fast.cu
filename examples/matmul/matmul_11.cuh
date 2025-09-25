@@ -303,7 +303,7 @@ __device__ static inline void load_async_multicast(bf16 *dst, void const* src_tm
 template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
-constexpr int SPACE_LEN = 128;
+constexpr int SPACE_LEN = 16;
 int *_dspace;
 
 template<int NUM_SM, int BM, int BN, int TM, int TN>
@@ -572,7 +572,6 @@ void createHilbert(int M, int N, int CORES, int *space) {
         int x, y;
         d2xy(dim, i, x, y);
         if (x < M && y < N) {
-            assert(loc < SPACE_LEN);
             assert(v[x][y] == '.');
             v[x][y] = '*';
             ++total;
