@@ -335,9 +335,9 @@ struct Schedule<2, NUM_SM, BM, BN, TM, TN> {
 
 template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
+    alignas(1024) bf16 C[BN*BM]; // no padding, swizzling resolves bank conflicts
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM]; // no padding, swizzling resolves bank conflicts
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
     int space[SPACE_LEN];
 };
@@ -351,7 +351,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
     assert((M / BM) % CLUSTER_M == 0);
     assert((N / BN) % CLUSTER_N == 0);
 
-    extern __shared__ __align__(128) uint8_t smem[];
+    extern __shared__ __align__(1024) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
     bf16 *sA = s.A, *sB = s.B, *sC = s.C;
     uint64_t *full = s.full, *empty = s.empty;
@@ -503,7 +503,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             
             // CU_TENSOR_MAP_SWIZZLE_128B that removes conflicts up to 8 rows
             // for shared memory addresses that with a 64-d fastest dimension
-            #define SWIZZLE_ADDRESS(add) (((add & 7 << 7) >> 3) ^ add)
+            // 7 << 7 defines the following bit mask:
+            // 0000 0000  0000 0000  0000 0011  1000 0000
+            // thus, we flip address bits 5, 6, 7 if the values of address bits
+            // 8, 9, 10 is 1, respectively.
+            // see https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-swizzling-modes
+            #define SWIZZLE_ADDRESS(add) (((add & (7 << 7)) >> 3) ^ add)
 
 
             asm volatile("cp.async.bulk.wait_group 0;");
